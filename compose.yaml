@@ -1,0 +1,131 @@
+name: sentinel-live
+
+x-app: &app
+  build: ./backend
+  env_file: .env
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  environment:
+    DATABASE_URL: postgresql+psycopg://sentinel:${POSTGRES_PASSWORD}@postgres:5432/sentinel
+    STORAGE_MODE: minio
+    MILVUS_URI: http://milvus:19530
+  restart: unless-stopped
+
+services:
+  frontend:
+    build: ./frontend
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${WEB_PORT:-8088}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  api:
+    <<: *app
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  postgres:
+    image: postgres:16.8-alpine
+    environment:
+      POSTGRES_DB: sentinel
+      POSTGRES_USER: sentinel
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Run python3 scripts/configure.py first}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sentinel -d sentinel"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  adminer:
+    image: adminer:latest
+    ports:
+      - "127.0.0.1:${ADMINER_PORT:-8090}:8080"
+    environment:
+      ADMINER_DEFAULT_SERVER: postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    <<: *app
+    command: python -m app.worker
+    depends_on:
+      api:
+        condition: service_healthy
+
+  mail:
+    <<: *app
+    profiles: ["mail"]
+    command: python -m app.mail
+    depends_on:
+      api:
+        condition: service_healthy
+
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.18
+    profiles: ["vectors"]
+    environment:
+      ETCD_AUTO_COMPACTION_MODE: revision
+      ETCD_AUTO_COMPACTION_RETENTION: "1000"
+      ETCD_QUOTA_BACKEND_BYTES: "4294967296"
+    command:
+      - etcd
+      - -advertise-client-urls=http://etcd:2379
+      - -listen-client-urls=http://0.0.0.0:2379
+      - --data-dir=/etcd
+    volumes:
+      - etcd_data:/etcd
+    restart: unless-stopped
+
+  milvus:
+    image: milvusdb/milvus:v2.5.6
+    profiles: ["vectors"]
+    command: ["milvus", "run", "standalone"]
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: ${MINIO_ENDPOINT:?Set MINIO_ENDPOINT in .env}
+      MINIO_ACCESS_KEY_ID: ${MINIO_ACCESS_KEY:?Set MINIO_ACCESS_KEY in .env}
+      MINIO_SECRET_ACCESS_KEY: ${MINIO_SECRET_KEY:?Set MINIO_SECRET_KEY in .env}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - etcd
+    volumes:
+      - milvus_data:/var/lib/milvus
+    restart: unless-stopped
+
+  attu:
+    image: zilliz/attu:v2.5
+    profiles: ["vectors"]
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${ATTU_PORT:-8089}:3000"
+    environment:
+      MILVUS_URL: milvus:19530
+    depends_on:
+      - milvus
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  minio_data:
+  etcd_data:
+  milvus_data:
+  ollama_data:
+  local_evidence:
